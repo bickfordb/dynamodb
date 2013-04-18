@@ -79,7 +79,6 @@ func (c *Client) Authorization(request *http.Request, body []byte, at time.Time)
   kSigning := hmacsha256(kService, []byte("aws4_request"))
   sig := toHex(hmacsha256(kSigning, []byte(signingString)))
   auth := fmt.Sprintf("AWS4-HMAC-SHA256 Credential=" + credential + ",SignedHeaders=" + signedHeaders + ",Signature=" + sig)
-
   return auth
 }
 
