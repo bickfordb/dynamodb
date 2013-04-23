@@ -12,30 +12,40 @@ import (
    "sort"
    "strings"
    "strconv"
+   "github.com/bickfordb/lg"
    "time")
 
 const (
   USEast1 string = "dynamodb.us-east-1.amazonaws.com"
+  EndPointFormat = "dynamodb.%s.amazonaws.com"
   hmacAlgorithm = "AWS4-HMAC-SHA256"
   signatureVersion = "aws4_request"
   amzDateFormat = "20060102T150405Z"
   ymdFormat = "20060102"
-  regionName = "us-east-1"
   service = "dynamodb" // dynamodb?
+  Equals = "EQ"
 )
+
+var log = lg.GetLog("dynamodb")
+
+func (c *Client) EndPoint() string {
+  return fmt.Sprintf(EndPointFormat, c.Region)
+}
 
 type Client struct {
   SecretKey string
   AccessKey string
-  EndPoint string
+  Region string
 }
 
-func NewClient(access string, secret string, endPoint string) *Client {
-  return &Client{SecretKey:secret, AccessKey:access, EndPoint:endPoint}
+func NewClient(access string, secret string, region string) *Client {
+  if access == "" || secret == "" || region == "" {
+    return nil
+  }
+  return &Client{SecretKey:secret, AccessKey:access, Region:region}
 }
 
 func (c *Client) Authorization(request *http.Request, body []byte, at time.Time) (result string) {
-  //authorization := "AWS4-HMAC-SHA256 Credential=AccessKeyID/20120116/us-east-1/dynamodb/aws4_request,SignedHeaders=host;x-amz-date;x-amz-target,Signature=145b1567ab3c50d929412f28f52c45dbf1e63ec5c66023d232a539a4afd11fd9"
   canonical := bytes.Buffer{}
   canonical.WriteString(strings.ToUpper(request.Method))
   canonical.WriteString("\n")
@@ -70,11 +80,11 @@ func (c *Client) Authorization(request *http.Request, body []byte, at time.Time)
   canonical.WriteString(tosha256hex(body))
   canonicalSignature := tosha256hex(canonical.Bytes())
   requestYMD := at.Format(ymdFormat)
-  credentialScope := requestYMD + "/" + regionName + "/" + service + "/" + signatureVersion
+  credentialScope := requestYMD + "/" + c.Region + "/" + service + "/" + signatureVersion
   credential := c.AccessKey + "/" + credentialScope
   signingString := hmacAlgorithm + "\n" + at.Format(amzDateFormat) + "\n" + credentialScope + "\n" + canonicalSignature
   kDate := hmacsha256([]byte("AWS4" + c.SecretKey), []byte(requestYMD))
-  kRegion := hmacsha256(kDate, []byte(regionName))
+  kRegion := hmacsha256(kDate, []byte(c.Region))
   kService := hmacsha256(kRegion, []byte(service))
   kSigning := hmacsha256(kService, []byte("aws4_request"))
   sig := toHex(hmacsha256(kSigning, []byte(signingString)))
@@ -109,6 +119,22 @@ func DynamoName(field reflect.StructField) (name string) {
   }
 }
 
+func (c *Client) DeleteItem(table string, keys map[string]interface{}) (err error) {
+  var in struct {
+    Key map[string]AttributeValue
+    TableName string
+  }
+  in.TableName = table
+  in.Key = make(map[string]AttributeValue)
+  for key, val := range keys {
+    in.Key[key] = toDynamoAttrVal(val)
+  }
+  var out struct {
+  }
+  err = c.runJSONRequest("DeleteItem", in, &out)
+  return
+}
+
 func (c *Client) PutItem(table string, item interface{}, replace bool) (err error) {
   var in struct {
     TableName string
@@ -127,7 +153,8 @@ func (c *Client) PutItem(table string, item interface{}, replace bool) (err erro
     v := vf.Interface()
     attrName := DynamoName(sf)
     attrVal := toDynamoAttrVal(v)
-    if attrVal != nil {
+    xs, ok := attrVal["S"]
+    if attrVal != nil && (!ok || xs != "") {
       in.Item[attrName] = attrVal
     }
   }
@@ -142,13 +169,15 @@ func (c *Client) PutItem(table string, item interface{}, replace bool) (err erro
 
 func (c *Client) runJSONRequest(method string, in interface{}, out interface{}) (err error) {
   body, _ := json.Marshal(in)
+  println("run json", method, string(body))
   bodyBuf := bytes.NewBuffer(body)
   hc := &http.Client{}
   now := time.Now().UTC()
-  req, err := http.NewRequest("POST", "http://" + c.EndPoint + "/", bodyBuf)
-  req.Header.Set("Host", c.EndPoint)
+  endPoint := c.EndPoint()
+  req, err := http.NewRequest("POST", "http://" + endPoint + "/", bodyBuf)
+  req.Header.Set("Host", endPoint)
   req.Header.Set("x-amz-date", now.Format(amzDateFormat))
-  req.Header.Set("x-amz-target", "DynamoDB_20111205." + method)
+  req.Header.Set("x-amz-target", "DynamoDB_20120810." + method)
   req.Header.Set("Content-Type", "application/x-amz-json-1.0")
   req.Header.Set("Date", now.Format(time.RFC1123))
   req.Header.Set("Authorization", c.Authorization(req, body, now))
@@ -176,17 +205,20 @@ func toDynamoAttrVal(value interface{}) (result map[string]string) {
     result = map[string]string{"S": unk}
   case int, uint, int8, int16, int32, int64, uint8, uint16, uint32, uint64:
     result = map[string]string{"N": fmt.Sprintf("%d", unk)}
+  case bool:
+    s := "0"
+    if unk { s = "1" }
+    result = map[string]string{"N": s}
   }
   return
 }
+//
 
 func (c *Client) GetItem(table string, hashKey interface {}, rangeKey interface {}, out interface{}) (err error) {
   if (out == nil) { return fmt.Errorf("expecting out") }
   tOut := reflect.TypeOf(out)
   if (tOut.Kind() != reflect.Ptr) { return fmt.Errorf("expecting ptr to struct") }
   outV := reflect.ValueOf(out).Elem()
-
-
   var in struct {
     TableName string
     Key struct {
@@ -209,41 +241,9 @@ func (c *Client) GetItem(table string, hashKey interface {}, rangeKey interface 
   err = c.runJSONRequest("GetItem", in, &result)
   fmt.Println("result", result)
   for i := 0; i < t.NumField(); i += 1 {
-    structField := t.Field(i)
-    dynoField := DynamoName(structField)
-    if result.Item[dynoField] == nil { continue }
+    dynoField := DynamoName(t.Field(i))
     valField := outV.Field(i)
-    for key, s := range result.Item[dynoField] {
-      switch k := valField.Kind(); k {
-      case reflect.String:
-        if key == "S" {
-          valField.SetString(s)
-        }
-      case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-        if key == "N" {
-          f, e := strconv.ParseFloat(s, 64)
-          if e != nil { err = e; return }
-          f0 := int64(f)
-          valField.SetInt(f0)
-        }
-      case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-        if key == "N" {
-          f, e := strconv.ParseFloat(s, 64)
-          if e != nil { err = e; return }
-          f0 := uint64(f)
-          valField.SetUint(f0)
-        }
-      case reflect.Float32, reflect.Float64:
-        if key == "N" {
-          f, e := strconv.ParseFloat(s, 64)
-          if e != nil { err = e; return }
-          valField.SetFloat(f)
-        }
-      default:
-        err = fmt.Errorf("unexpected kind %s", k)
-        return
-      }
-    }
+    setField(&valField, result.Item[dynoField])
   }
   return
 }
@@ -252,35 +252,12 @@ func (c *Client) ListTables() (tables []string, err error) {
   var params struct{
     Limit int}
   params.Limit = 100
-  body, _ := json.Marshal(params)
-  bodyBuf := bytes.NewBuffer(body)
-  hc := &http.Client{}
-  now := time.Now().UTC()
-  req, err := http.NewRequest("POST", "http://" + c.EndPoint + "/", bodyBuf)
-  req.Header.Set("Host", c.EndPoint)
-  req.Header.Set("x-amz-date", now.Format(amzDateFormat))
-  req.Header.Set("x-amz-target", "DynamoDB_20111205.ListTables")
-  req.Header.Set("Content-Type", "application/x-amz-json-1.0")
-  req.Header.Set("Date", now.Format(time.RFC1123))
-  req.Header.Set("Authorization", c.Authorization(req, body, now))
-
-  response, err := hc.Do(req)
-  if err == io.EOF { err = nil }
-  if err != nil { return }
-  defer response.Body.Close()
-  if response.StatusCode != 200 {
-    errBuf := &bytes.Buffer{}
-    io.Copy(errBuf, response.Body)
-    err = &AmazonFailure{response.StatusCode, errBuf.String()}
-    return
-  }
-  var msg struct {
+  var out struct {
     TableNames []string
   }
-  err = json.NewDecoder(response.Body).Decode(&msg)
-  if err == io.EOF { err = nil }
+  err = c.runJSONRequest("ListTables", params, &out)
   if err != nil { return }
-  tables = msg.TableNames
+  tables = out.TableNames
   return
 }
 
@@ -293,4 +270,210 @@ func (a *AmazonFailure) Error() string {
   return fmt.Sprintf("amazon failure (%d) --- %q", a.Code, a.Message)
 }
 
+type TableDescription struct {
+  CreationDateTime float64
+  ItemCount int
+  KeySchema []KeySchema
+  AttributeDefinitions []AttributeDefinition
+  TableName string
+  TableSizeBytes int
+  TableStatus string
+}
 
+type AttributeDefinition struct {
+  AttributeName string
+  AttributeType string
+}
+type KeySchema struct {
+  AttributeName string
+  KeyType string
+}
+
+func (c *Client) CreateTable(name string, hashName string, hashType string, rangeName string, rangeType string) (description *TableDescription, err error) {
+  if hashName == "" {
+    err = fmt.Errorf("expecting hashName")
+    return
+  }
+  if hashType == "" {
+    err = fmt.Errorf("expecting hashType")
+    return
+  }
+  if rangeName != "" && rangeType == "" {
+    err = fmt.Errorf("expecting rangeType")
+    return
+  }
+  type LocalSecondaryIndex struct {
+    IndexName string
+    KeySchema []KeySchema
+    Projection struct {
+      ProjectionType string
+    }
+  }
+
+  var in struct {
+    TableName string
+    ProvisionedThroughput struct {
+      ReadCapacityUnits int
+      WriteCapacityUnits int
+    }
+    AttributeDefinitions []AttributeDefinition
+    LocalSecondaryIndexes []LocalSecondaryIndex `json:"LocalSecondaryIndexes,omitempty"`
+    KeySchema []KeySchema
+  }
+  in.LocalSecondaryIndexes = make([]LocalSecondaryIndex, 0)
+  in.TableName = name
+  in.ProvisionedThroughput.ReadCapacityUnits = 1
+  in.ProvisionedThroughput.WriteCapacityUnits = 1
+  in.KeySchema = append(in.KeySchema, KeySchema{hashName, "HASH"})
+  in.AttributeDefinitions = append(in.AttributeDefinitions, AttributeDefinition{hashName, hashType})
+  if rangeName != "" {
+    in.KeySchema = append(in.KeySchema, KeySchema{rangeName, "RANGE"})
+    in.AttributeDefinitions = append(in.AttributeDefinitions, AttributeDefinition{rangeName, rangeType})
+  }
+  var out struct {
+    TableDescription TableDescription
+  }
+  err = c.runJSONRequest("CreateTable", in, &out)
+  if err != nil { return }
+  description = &out.TableDescription
+  return
+}
+
+func (c *Client) DeleteTable(name string) (err error) {
+  var in struct {
+    TableName string
+  }
+  var out struct {
+  }
+  in.TableName = name
+  err = c.runJSONRequest("DeleteTable", &in, &out)
+  return
+}
+
+
+func (c *Client) DescribeTable(name string) (desc TableDescription, err error) {
+  var in struct {
+    TableName string
+  }
+  in.TableName = name
+  var out struct {
+    Table TableDescription
+  }
+  err = c.runJSONRequest("DescribeTable", in, &out)
+  if err != nil { return }
+  desc = out.Table
+  return
+}
+
+type AttributeValue map[string]string
+
+type KeyCondition struct {
+  AttributeValueList []AttributeValue `json:"",omitempty`
+  ComparisonOperator string
+}
+
+type QueryRequest struct {
+  AttributesToGet []string `json:"",omitempty`
+  ConsistentRead bool
+  ExclusiveStartKey map[string]string `json:"",omitempty`
+  IndexName string `json:"IndexName,omitempty"`
+  KeyConditions map[string]KeyCondition `json:"",omitempty`
+  //Limit int
+  //ReturnConsumedCapacity string `json:"",omitempty`
+  ScanIndexForward bool
+  Select string
+  TableName string
+}
+
+type Row map[string]AttributeValue
+
+func (r Row) Scan(item interface {}) {
+  vP := reflect.ValueOf(item)
+  tP := reflect.TypeOf(item)
+  if tP.Kind() != reflect.Ptr { return }
+  vS := vP.Elem()
+  tS := vS.Type()
+  numFields := vS.NumField()
+  for i := 0; i < numFields; i += 1 {
+    typeField := tS.Field(i)
+    valField := vS.Field(i)
+    key := DynamoName(typeField)
+    val := r[key]
+    setField(&valField, val)
+  }
+}
+
+func setField(field *reflect.Value, dynAttr map[string]string) {
+  switch kind := field.Kind(); kind {
+  case reflect.String:
+    val := ""
+    if dynAttr != nil {
+      val = dynAttr["S"]
+    }
+    field.SetString(val)
+  case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+    var val int64 = 0
+    if dynAttr != nil {
+      f, e := strconv.ParseFloat(dynAttr["N"], 64)
+      if e != nil { val = int64(f) }
+    }
+    field.SetInt(val)
+  case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+    var val uint64
+    if dynAttr != nil {
+      f, e := strconv.ParseFloat(dynAttr["N"], 64)
+      if e != nil { val = uint64(f) }
+    }
+    field.SetUint(val)
+  case reflect.Float32, reflect.Float64:
+    var val float64
+    if dynAttr != nil {
+      f, e := strconv.ParseFloat(dynAttr["N"], 64)
+      if e != nil { val = f }
+    }
+    field.SetFloat(val)
+  case reflect.Bool:
+    var val bool
+    if dynAttr != nil {
+      f, e := strconv.ParseFloat(dynAttr["N"], 64)
+      if e != nil { val = f != 0 }
+    }
+    field.SetBool(val)
+  default:
+    panic("unexpected type")
+    return
+  }
+}
+
+
+func (c *Client) Query(table string, keys map[string]interface{}) (rows []Row, err error) {
+  if len(keys) == 0 {
+    err = fmt.Errorf("expecting keys")
+    return
+  }
+  var in QueryRequest
+  in.TableName = table
+  in.Select = "ALL_ATTRIBUTES"
+  in.KeyConditions = make(map[string]KeyCondition)
+  //in.Limit = 100
+  for key, val := range keys {
+    in.KeyConditions[key] = KeyCondition{
+      AttributeValueList: []AttributeValue{toDynamoAttrVal(val)},
+      ComparisonOperator: Equals}
+  }
+
+  var out struct {
+    Count int
+    Items []map[string]AttributeValue
+    LastEvaluatedKey map[string]AttributeValue
+  }
+  err = c.runJSONRequest("Query", in, &out)
+  if err != nil { return }
+  count := 0
+  if out.Count >= 0 { count = out.Count }
+  rows = make([]Row, 0, count)
+  for _, i := range out.Items {
+    rows = append(rows, i)
+  }
+  return
+}
